@@ -9,14 +9,14 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
-# If you want ngrok automatic tunnel
+# Optional ngrok
 try:
     from pyngrok import ngrok, conf as ngrok_conf
     PYNGROK_AVAILABLE = True
 except Exception:
     PYNGROK_AVAILABLE = False
 
-# Your original imports / audio processing (kept mostly intact)
+# --- Your original stack ---
 import torchaudio as ta
 import torch
 from chatterbox.tts import ChatterboxTTS
@@ -25,8 +25,20 @@ from pedalboard import (
     Compressor, Chorus, Delay, PitchShift, Distortion
 )
 
-# ----- Your audio processing definitions (copied / minimally adapted) -----
+# ----------------- FIXED VOICE CLONE PROMPT -----------------
+# Always use voice.wav (can override via env VOICE_PROMPT_PATH if you really want)
+AUDIO_PROMPT_PATH = os.environ.get(
+    "VOICE_PROMPT_PATH",
+    os.path.join(os.path.dirname(__file__), "voice.wav")
+)
 
+if not os.path.isfile(AUDIO_PROMPT_PATH):
+    print(f"[FATAL] voice clone prompt not found: {AUDIO_PROMPT_PATH}")
+    print("        Put voice.wav next to server.py or set VOICE_PROMPT_PATH.")
+    # Don't exit; let the websocket respond with a clean error instead.
+# ------------------------------------------------------------
+
+# ----- Audio FX pipeline (unchanged) -----
 def add_monster_layer(audio, sr, semitones=-9, mix=0.25):
     monster = PitchShift(semitones=semitones)(audio, sr)
     monster = HighpassFilter(cutoff_frequency_hz=50)(monster, sr)
@@ -46,56 +58,56 @@ board = Pedalboard([
 ])
 
 def process_chunk_ai_voice(audio_tensor, sr):
-    # Accepts either torch tensor or numpy array like your original code
     if isinstance(audio_tensor, torch.Tensor):
         audio_np = audio_tensor.cpu().numpy()
     else:
         audio_np = np.array(audio_tensor)
 
     if audio_np.ndim == 1:
-        audio_np = np.expand_dims(audio_np, axis=0)  # (channels, samples)
+        audio_np = np.expand_dims(audio_np, axis=0)  # (channels, frames)
 
     effected = board(audio_np, sr)
-
-    # One monster layer
     effected = add_monster_layer(effected, sr, semitones=-3, mix=0.2)
 
-    # Ensure float32, shape (channels, samples)
     if effected.dtype != np.float32:
         effected = effected.astype(np.float32)
-    return effected
-
-# -------------------------------------------------------------------------
+    return effected  # (channels, frames) float32
+# -----------------------------------------
 
 app = FastAPI()
 
-# Initialize/load model at startup (blocking)
-print("Loading TTS model... (this could take a while)")
+print("Loading TTS model...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = ChatterboxTTS.from_pretrained(device=device)
-# Optional optimizations from your original:
 try:
     model.t3 = torch.compile(model.t3, fullgraph=True, mode="reduce-overhead")
 except Exception as e:
-    print("Warning: torch.compile failed or not beneficial on this platform:", e)
-print("Model loaded. Sample rate:", getattr(model, "sr", None))
+    print("torch.compile not used:", e)
+print("Model ready. SR:", getattr(model, "sr", None))
 
-# Helper: interleave (channels, samples) -> interleaved samples per frame (float32)
 def interleave_channels(arr: np.ndarray) -> np.ndarray:
-    # arr shape: (channels, frames)
     if arr.ndim == 1:
         arr = np.expand_dims(arr, 0)
-    channels, frames = arr.shape
-    # transpose to (frames, channels), then flatten -> interleaved
-    return arr.T.flatten()
+    # arr: (channels, frames) -> interleaved 1D
+    return arr.T.reshape(-1)
 
 @app.websocket("/ws/tts")
 async def websocket_tts(websocket: WebSocket):
     await websocket.accept()
     loop = asyncio.get_running_loop()
+
+    # Hard fail early if voice prompt missing
+    if not os.path.isfile(AUDIO_PROMPT_PATH):
+        await websocket.send_json({
+            "type": "error",
+            "message": f"voice prompt not found at {AUDIO_PROMPT_PATH}"
+        })
+        await websocket.close()
+        return
+
     try:
+        # Accept init JSON but ignore any audio_prompt_path from client
         init_msg = await websocket.receive_text()
-        # Expecting a JSON: {"text": "...", "audio_prompt_path": "...", "chunk_size": 100}
         try:
             req = json.loads(init_msg)
         except Exception:
@@ -104,89 +116,107 @@ async def websocket_tts(websocket: WebSocket):
             return
 
         text = req.get("text", "")
-        audio_prompt_path = req.get("audio_prompt_path", None)
-        chunk_size = req.get("chunk_size", 100)
-
         if not text:
             await websocket.send_json({"type": "error", "message": "No text provided"})
             await websocket.close()
             return
 
+        chunk_size = int(req.get("chunk_size", 100))
+        exaggeration = float(req.get("exaggeration", 0.7))
+        cfg_weight = float(req.get("cfg_weight", 0.3))
+
         sr = getattr(model, "sr", 48000)
-        channels = 1  # assume your model returns mono; adapt if needed
+        channels = 1  # most TTS is mono; client deinterleaves if needed
 
-        # Inform client about audio meta
-        await websocket.send_json({"type": "meta", "sr": sr, "channels": channels, "dtype": "float32"})
+        # Tell client meta (and explicitly state which prompt file we're using)
+        await websocket.send_json({
+            "type": "meta",
+            "sr": sr,
+            "channels": channels,
+            "dtype": "float32",
+            "voice_prompt": os.path.basename(AUDIO_PROMPT_PATH)
+        })
 
-        # Use a thread to run the blocking generator (model.generate_stream)
         def produce_and_send():
             try:
                 for audio_chunk, metrics in model.generate_stream(
-                        text,
-                        audio_prompt_path=audio_prompt_path,
-                        chunk_size=chunk_size,
-                        exaggeration=req.get("exaggeration", 0.7),
-                        cfg_weight=req.get("cfg_weight", 0.3),
+                    text,
+                    audio_prompt_path=AUDIO_PROMPT_PATH,  # <-- FORCE clone prompt here
+                    chunk_size=chunk_size,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
                 ):
-                    effected = process_chunk_ai_voice(audio_chunk, sr)  # (channels, frames) float32
-
-                    # Ensure shape (channels, frames)
+                    effected = process_chunk_ai_voice(audio_chunk, sr)  # (C, F)
                     if effected.ndim == 1:
                         effected = np.expand_dims(effected, 0)
 
-                    channels_local, frames = effected.shape
+                    frames = effected.shape[1]
                     interleaved = interleave_channels(effected)  # float32 1-D
 
-                    # Tell client a chunk is coming
-                    coro_send_json = websocket.send_json({"type": "chunk", "frames": frames})
-                    fut = asyncio.run_coroutine_threadsafe(coro_send_json, loop)
-                    fut.result()
+                    # announce + send bytes
+                    fut1 = asyncio.run_coroutine_threadsafe(
+                        websocket.send_json({"type": "chunk", "frames": frames}),
+                        loop
+                    )
+                    fut1.result()
 
-                    # Send raw bytes (Float32 little-endian)
-                    coro_send_bytes = websocket.send_bytes(interleaved.tobytes())
-                    fut2 = asyncio.run_coroutine_threadsafe(coro_send_bytes, loop)
+                    fut2 = asyncio.run_coroutine_threadsafe(
+                        websocket.send_bytes(interleaved.tobytes()),
+                        loop
+                    )
                     fut2.result()
 
-                    # Optionally send metrics for debugging
+                    # optional metrics
                     try:
-                        coro_metrics = websocket.send_json({"type": "metrics", "rtf": getattr(metrics, "rtf", None), "chunk_count": getattr(metrics, "chunk_count", None)})
-                        asyncio.run_coroutine_threadsafe(coro_metrics, loop).result()
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send_json({
+                                "type": "metrics",
+                                "rtf": getattr(metrics, "rtf", None),
+                                "chunk_count": getattr(metrics, "chunk_count", None)
+                            }),
+                            loop
+                        ).result()
                     except Exception:
                         pass
 
-                # Finished sending all chunks
-                asyncio.run_coroutine_threadsafe(websocket.send_json({"type": "end"}), loop).result()
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send_json({"type": "end"}),
+                    loop
+                ).result()
             except Exception as e:
                 try:
-                    asyncio.run_coroutine_threadsafe(websocket.send_json({"type": "error", "message": str(e)}), loop).result()
+                    asyncio.run_coroutine_threadsafe(
+                        websocket.send_json({"type": "error", "message": str(e)}),
+                        loop
+                    ).result()
                 except Exception:
                     pass
 
         thr = threading.Thread(target=produce_and_send, daemon=True)
         thr.start()
 
-        # keep websocket open until thread finishes or client disconnects
+        # Keep socket alive until producer finishes or client bails
         while thr.is_alive():
             try:
                 msg = await websocket.receive_text()
-                # Client can send commands; if they send {"cmd":"stop"} we break
+                # Accept stop command; no hard interruption hook unless model supports it
                 try:
                     js = json.loads(msg)
                     if js.get("cmd") == "stop":
-                        # No standard way to stop model.generate_stream; we rely on it checking external flag in a more advanced setup
-                        await websocket.send_json({"type": "info", "message": "Stop requested (not implemented)."})
+                        await websocket.send_json({"type": "info", "message": "Stop requested (generator will finish current step)."})
                         break
                 except Exception:
                     pass
                 await asyncio.sleep(0.01)
             except WebSocketDisconnect:
                 break
-        # Ensure finished
+
         await websocket.close()
+
     except WebSocketDisconnect:
         print("Client disconnected")
     except Exception as e:
-        print("Websocket error:", e)
+        print("WebSocket error:", e)
         try:
             await websocket.close()
         except Exception:
@@ -197,18 +227,14 @@ if __name__ == "__main__":
     use_ngrok = os.environ.get("USE_NGROK", "1") == "1" and PYNGROK_AVAILABLE
 
     if use_ngrok:
-        # Attempt to open ngrok HTTP tunnel to the server port
-        ngrok_token = os.environ.get("NGROK_AUTHTOKEN")
-        if ngrok_token:
-            ngrok_conf.get_default().auth_token = ngrok_token
+        token = os.environ.get("NGROK_AUTHTOKEN")
+        if token:
+            ngrok_conf.get_default().auth_token = token
         try:
             public_url = ngrok.connect(port, "http").public_url
-            print("ngrok tunnel created:", public_url)
-            print("WebSocket endpoint (ws):", public_url.replace("http", "ws") + "/ws/tts")
+            print("ngrok:", public_url)
+            print("WebSocket:", public_url.replace("http", "ws") + "/ws/tts")
         except Exception as e:
             print("ngrok failed:", e)
-            print("Start server without ngrok or install/configure pyngrok.")
-    else:
-        print("ngrok disabled or not available. Running locally on port", port)
 
     uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
